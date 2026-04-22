@@ -1,0 +1,25 @@
+[package]
+name = "sekirei"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sekirei"
+path = "src/compiler/main.rs"
+
+[features]
+# LLVMが入っている環境でのみ有効化: cargo build --features codegen
+codegen = ["inkwell"]
+
+[dependencies]
+inkwell = { version = "0.4", features = ["llvm17-0"], optional = true }
+serde   = { version = "1", features = ["derive"] }
+toml    = "~0.5"
+glob    = "0.3"
+
+[[bin]]
+name = "skp"
+path = "src/skp/main.rs"
+
+[build-dependencies]
+cc = "1"

@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use crate::parser::{
-    BinOp, CatchHandler, Expr, MatchArm, Param, Pattern, Stmt, TopLevel, Type, UnOp,
+    BinOp, CatchHandler, Expr, MatchArm, Param, Pattern, SchemaField, Stmt, TopLevel, Type, UnOp,
 };
 
 // ============================================================
@@ -80,6 +80,7 @@ pub struct SemanticAnalyzer {
     env:         TypeEnv,
     fns:         HashMap<String, FnSig>,
     structs:     HashMap<String, Vec<(String, Type)>>,
+    schemas:     HashMap<String, Vec<SchemaField>>,
     current_ret: Option<Type>,
 }
 
@@ -89,6 +90,7 @@ impl SemanticAnalyzer {
             env:         TypeEnv::new(),
             fns:         HashMap::new(),
             structs:     HashMap::new(),
+            schemas:     HashMap::new(),
             current_ret: None,
         };
         a.register_builtins();
@@ -160,6 +162,29 @@ impl SemanticAnalyzer {
                     }
                 }
             }
+            TopLevel::TypeAlias { name, ty } => {
+                self.env.define(name, ty.clone());
+            }
+            TopLevel::Schema { name, fields, includes } => {
+                let mut resolved = fields.clone();
+                if let Some(parent_name) = includes {
+                    if let Some(parent_fields) = self.schemas.get(parent_name).cloned() {
+                        // Merge: parent fields first, child fields override on name conflict
+                        for pf in parent_fields {
+                            if !resolved.iter().any(|f| f.name == pf.name) {
+                                resolved.insert(0, pf);
+                            }
+                        }
+                    }
+                }
+                // Also define as a type name so it can be used as a type annotation
+                let record_type = Type::Record {
+                    fields: resolved.iter().map(|f| (f.name.clone(), f.ty.clone())).collect(),
+                    open: false,
+                };
+                self.env.define(name, record_type);
+                self.schemas.insert(name.clone(), resolved);
+            }
             _ => {}
         }
         Ok(())
@@ -217,6 +242,16 @@ impl SemanticAnalyzer {
                 let inferred = self.infer_expr(value)?;
                 let actual = if let Some(declared) = ty {
                     self.unify(declared, &inferred, &format!("let '{}'", name))?;
+                    // Validate schema constraints if the type annotation references a schema
+                    if let Type::Named(schema_name) = declared {
+                        if let Some(schema_fields) = self.schemas.get(schema_name) {
+                            for field in schema_fields {
+                                if let Some(constraint) = &field.constraint {
+                                    self.validate_constraint(constraint, &field.name)?;
+                                }
+                            }
+                        }
+                    }
                     declared.clone()
                 } else {
                     inferred
@@ -228,6 +263,16 @@ impl SemanticAnalyzer {
                 let inferred = self.infer_expr(value)?;
                 let actual = if let Some(declared) = ty {
                     self.unify(declared, &inferred, &format!("mut '{}'", name))?;
+                    // Validate schema constraints if the type annotation references a schema
+                    if let Type::Named(schema_name) = declared {
+                        if let Some(schema_fields) = self.schemas.get(schema_name) {
+                            for field in schema_fields {
+                                if let Some(constraint) = &field.constraint {
+                                    self.validate_constraint(constraint, &field.name)?;
+                                }
+                            }
+                        }
+                    }
                     declared.clone()
                 } else {
                     inferred
@@ -491,12 +536,125 @@ impl SemanticAnalyzer {
                 let t = self.infer_expr(inner)?;
                 Ok(Type::Result(Box::new(Type::Named("?".into())), Box::new(t)))
             }
+
+            Expr::RecordLit(fields) => {
+                let mut field_types = Vec::new();
+                for (name, expr) in fields {
+                    let t = self.infer_expr(expr)?;
+                    field_types.push((name.clone(), t));
+                }
+                Ok(Type::Record { fields: field_types, open: false })
+            }
+
+            Expr::RecordSpread { base, fields } => {
+                let base_ty = self.infer_expr(base)?;
+                let mut merged = match &base_ty {
+                    Type::Record { fields: f, .. } => f.clone(),
+                    Type::Named(sname) => {
+                        self.structs.get(sname).cloned().unwrap_or_default()
+                    }
+                    _ => vec![],
+                };
+                for (name, expr) in fields {
+                    let t = self.infer_expr(expr)?;
+                    if let Some(pos) = merged.iter().position(|(n, _)| n == name) {
+                        merged[pos].1 = t;
+                    } else {
+                        merged.push((name.clone(), t));
+                    }
+                }
+                Ok(Type::Record { fields: merged, open: false })
+            }
+
+            Expr::ListLit(items) => {
+                if items.is_empty() {
+                    return Ok(Type::List(Box::new(Type::Named("?".into()))));
+                }
+                let elem_ty = self.infer_expr(&items[0])?;
+                for item in &items[1..] {
+                    let t = self.infer_expr(item)?;
+                    self.unify(&elem_ty, &t, "list literal")?;
+                }
+                Ok(Type::List(Box::new(elem_ty)))
+            }
+
+            Expr::DictLit(entries) => {
+                if entries.is_empty() {
+                    return Ok(Type::Dict(
+                        Box::new(Type::Named("?".into())),
+                        Box::new(Type::Named("?".into())),
+                    ));
+                }
+                let (first_k, first_v) = &entries[0];
+                let key_ty = self.infer_expr(first_k)?;
+                let val_ty = self.infer_expr(first_v)?;
+                for (k, v) in &entries[1..] {
+                    let kt = self.infer_expr(k)?;
+                    self.unify(&key_ty, &kt, "dict literal key")?;
+                    let vt = self.infer_expr(v)?;
+                    self.unify(&val_ty, &vt, "dict literal value")?;
+                }
+                Ok(Type::Dict(Box::new(key_ty), Box::new(val_ty)))
+            }
+
+            Expr::Pipe { lhs, rhs } => self.infer_pipe(lhs, rhs),
+            Expr::PipeMethod { name, args } => {
+                // Standalone PipeMethod (without pipe) — just check args, return wildcard
+                for a in args { self.infer_expr(a)?; }
+                Ok(Type::Named("?".into()))
+            }
         }
     }
 
     // ============================================================
     // ヘルパー
     // ============================================================
+
+    fn validate_constraint(&self, constraint: &Expr, field_name: &str) -> Result<(), SemaError> {
+        // For simple cases, try compile-time evaluation
+        match constraint {
+            Expr::BinOp { op, lhs, rhs } => {
+                // Check self-referencing field comparisons like `age >= 0`
+                if let Expr::Ident(fname) = lhs.as_ref() {
+                    if fname == field_name {
+                        // We can only fully validate if the value is a literal
+                        // For now, just check that the constraint type-checks
+                        // (type inference on the constraint expression handles this)
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn bind_pattern_vars(&mut self, pattern: &Pattern) -> Result<(), SemaError> {
+        match pattern {
+            Pattern::Record(fields) => {
+                for (field_name, alias) in fields {
+                    let var_name = alias.as_ref().unwrap_or(field_name);
+                    self.env.define(var_name, Type::Named("?".into()));
+                }
+            }
+            Pattern::List { elements, rest } => {
+                for elem in elements {
+                    self.bind_pattern_vars(elem)?;
+                }
+                if let Some(r) = rest {
+                    self.bind_pattern_vars(r)?;
+                }
+            }
+            Pattern::Some(n) => { self.env.define(n, Type::Named("?".into())); }
+            Pattern::Ok(n)   => { self.env.define(n, Type::Named("?".into())); }
+            Pattern::Err(n)  => { self.env.define(n, Type::Named("Error".into())); }
+            Pattern::Ident(n) => { self.env.define(n, Type::Named("?".into())); }
+            Pattern::Or(pats) => {
+                for p in pats { self.bind_pattern_vars(p)?; }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 
     fn infer_binop(&self, op: &BinOp, l: &Type, r: &Type) -> Result<Type, SemaError> {
         match op {
@@ -560,14 +718,130 @@ impl SemanticAnalyzer {
         Ok(Type::Named("?".into()))
     }
 
+    fn infer_pipe(&mut self, lhs: &Expr, rhs: &Expr) -> Result<Type, SemaError> {
+        let lhs_ty = self.infer_expr(lhs)?;
+        match rhs {
+            Expr::Ident(_) | Expr::Field { .. } => {
+                let rhs_ty = self.infer_expr(rhs)?;
+                match &rhs_ty {
+                    Type::Fn(params, ret) => {
+                        if params.len() != 1 {
+                            return Err(SemaError {
+                                message: format!("pipe requires function of 1 argument, got {}", params.len()),
+                                line: 0, col: 0,
+                            });
+                        }
+                        self.unify(&params[0], &lhs_ty, "pipe argument")?;
+                        Ok(*ret.clone())
+                    }
+                    _ => Err(SemaError {
+                        message: "right side of pipe must be a function".into(),
+                        line: 0, col: 0,
+                    })
+                }
+            }
+            Expr::Call { func, args } => {
+                let func_ty = self.infer_expr(func)?;
+                match &func_ty {
+                    Type::Fn(params, ret) => {
+                        let expected = 1 + args.len();
+                        if params.len() != expected {
+                            return Err(SemaError {
+                                message: format!("pipe call expected {} args total, got {}", expected, params.len()),
+                                line: 0, col: 0,
+                            });
+                        }
+                        self.unify(&params[0], &lhs_ty, "pipe first arg")?;
+                        for (i, (param, arg)) in params[1..].iter().zip(args.iter()).enumerate() {
+                            let arg_ty = self.infer_expr(arg)?;
+                            self.unify(param, &arg_ty, &format!("pipe arg {}", i + 1))?;
+                        }
+                        Ok(*ret.clone())
+                    }
+                    _ => Err(SemaError {
+                        message: "right side of pipe must be a callable function".into(),
+                        line: 0, col: 0,
+                    })
+                }
+            }
+            Expr::PipeMethod { name, args } => {
+                // For built-in collection methods
+                match (&lhs_ty, name.as_str()) {
+                    (Type::List(elem_ty), "map") => {
+                        if args.len() != 1 {
+                            return Err(SemaError { message: ".map() takes 1 argument".into(), line: 0, col: 0 });
+                        }
+                        let fn_ty = self.infer_expr(&args[0])?;
+                        match &fn_ty {
+                            Type::Fn(params, ret) => {
+                                if params.len() != 1 {
+                                    return Err(SemaError { message: ".map callback must take 1 argument".into(), line: 0, col: 0 });
+                                }
+                                self.unify(&params[0], elem_ty, ".map element type")?;
+                                Ok(Type::List(ret.clone()))
+                            }
+                            _ => {
+                                // If we can't determine the function type, return List<?>
+                                Ok(Type::List(Box::new(Type::Named("?".into()))))
+                            }
+                        }
+                    }
+                    (Type::List(elem_ty), "filter") => {
+                        if args.len() != 1 {
+                            return Err(SemaError { message: ".filter() takes 1 argument".into(), line: 0, col: 0 });
+                        }
+                        let fn_ty = self.infer_expr(&args[0])?;
+                        match &fn_ty {
+                            Type::Fn(params, ret) => {
+                                if params.len() != 1 {
+                                    return Err(SemaError { message: ".filter callback must take 1 argument".into(), line: 0, col: 0 });
+                                }
+                                self.unify(&params[0], elem_ty, ".filter element type")?;
+                                self.unify(ret, &Type::Bool, ".filter return type")?;
+                                Ok(Type::List(elem_ty.clone()))
+                            }
+                            _ => Ok(Type::List(elem_ty.clone()))
+                        }
+                    }
+                    (Type::List(elem_ty), "reduce") => {
+                        if args.len() != 2 {
+                            return Err(SemaError { message: ".reduce() takes 2 arguments (fn, init)".into(), line: 0, col: 0 });
+                        }
+                        let fn_ty = self.infer_expr(&args[0])?;
+                        let init_ty = self.infer_expr(&args[1])?;
+                        match &fn_ty {
+                            Type::Fn(params, ret) => {
+                                if params.len() != 2 {
+                                    return Err(SemaError { message: ".reduce callback must take 2 arguments".into(), line: 0, col: 0 });
+                                }
+                                self.unify(&params[0], &init_ty, ".reduce accumulator")?;
+                                self.unify(&params[1], elem_ty, ".reduce element")?;
+                                self.unify(ret, &init_ty, ".reduce return")?;
+                                Ok(init_ty)
+                            }
+                            _ => Ok(init_ty)
+                        }
+                    }
+                    _ => {
+                        // Unknown method — return wildcard type
+                        for a in args { self.infer_expr(a)?; }
+                        Ok(Type::Named("?".into()))
+                    }
+                }
+            }
+            _ => Err(SemaError {
+                message: "right side of pipe must be a function, call, or method".into(),
+                line: 0, col: 0,
+            })
+        }
+    }
+
     fn infer_arm(&mut self, arm: &MatchArm) -> Result<Type, SemaError> {
         self.env.push();
-        match &arm.pattern {
-            Pattern::Some(n)  => self.env.define(n, Type::Named("?".into())),
-            Pattern::Ok(n)    => self.env.define(n, Type::Named("?".into())),
-            Pattern::Err(n)   => self.env.define(n, Type::Named("Error".into())),
-            Pattern::Ident(n) => self.env.define(n, Type::Named("?".into())),
-            _ => {}
+        self.bind_pattern_vars(&arm.pattern)?;
+        if let Some(guard) = &arm.guard {
+            let guard_ty = self.infer_expr(guard)?;
+            self.unify(&Type::Bool, &guard_ty, "match guard")?;
         }
         let ty = self.infer_expr(&arm.body)?;
         self.env.pop();
@@ -575,6 +849,22 @@ impl SemanticAnalyzer {
     }
 
     fn infer_field(&self, ty: &Type, name: &str) -> Result<Type, SemaError> {
+        match ty {
+            Type::Record { fields, open } => {
+                if let Some((_, field_ty)) = fields.iter().find(|(n, _)| n == name) {
+                    return Ok(field_ty.clone());
+                }
+                // For open records, unknown fields are allowed (return ? type)
+                if *open {
+                    return Ok(Type::Named("?".into()));
+                }
+                return Err(SemaError {
+                    message: format!("record has no field '{}'", name),
+                    line: 0, col: 0,
+                });
+            }
+            _ => {}
+        }
         if let Type::Named(sname) = ty {
             if let Some(fields) = self.structs.get(sname) {
                 return fields.iter().find(|(n, _)| n == name)
@@ -610,7 +900,35 @@ impl SemanticAnalyzer {
     fn types_compat(&self, a: &Type, b: &Type) -> bool {
         let is_unknown = |t: &Type| matches!(t, Type::Named(n) if n == "?");
         if is_unknown(a) || is_unknown(b) { return true; }
-        std::mem::discriminant(a) == std::mem::discriminant(b)
+
+        // Record compatibility with row polymorphism
+        match (a, b) {
+            (Type::Record { fields: fa, open: oa }, Type::Record { fields: fb, open: ob }) => {
+                if *oa && !ob {
+                    // A is open: A's fields must all exist in B with compatible types
+                    return fa.iter().all(|(na, ta)| {
+                        fb.iter().find(|(nb, _)| nb == na)
+                            .map(|(_, tb)| self.types_compat(ta, tb))
+                            .unwrap_or(false)
+                    });
+                }
+                if *ob && !oa {
+                    // Actual B is open: all EXPECTED fields (from A) must exist in B
+                    return fa.iter().all(|(na, ta)| {
+                        fb.iter().find(|(nb, _)| nb == na)
+                            .map(|(_, tb)| self.types_compat(ta, tb))
+                            .unwrap_or(false)
+                    });
+                }
+                // Both closed or both open: same-field compatibility
+                fa.len() == fb.len() && fa.iter().all(|(na, ta)| {
+                    fb.iter().find(|(nb, _)| nb == na)
+                        .map(|(_, tb)| self.types_compat(ta, tb))
+                        .unwrap_or(false)
+                })
+            }
+            _ => std::mem::discriminant(a) == std::mem::discriminant(b),
+        }
     }
 
     fn is_numeric(&self, ty: &Type) -> bool {

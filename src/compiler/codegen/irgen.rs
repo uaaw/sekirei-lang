@@ -172,6 +172,9 @@ impl IrGen {
             TopLevel::Impl { methods, .. } => {
                 for m in methods { self.emit_top(m); }
             }
+            TopLevel::Schema { .. } => {
+                // Schema is a compile-time construct, no runtime code generated
+            }
             _ => {}
         }
     }
@@ -491,6 +494,12 @@ impl IrGen {
                 // Range は for ループ内でしか使わない → ここでは無視
                 self.emit_expr(start);
                 self.emit_expr(end);
+                Val::void()
+            }
+
+            // Phase 1 placeholder — structural types not yet codegen'd
+            Expr::RecordLit(_) | Expr::RecordSpread { .. } | Expr::ListLit(_) | Expr::DictLit(_)
+            | Expr::Pipe { .. } | Expr::PipeMethod { .. } => {
                 Val::void()
             }
         }

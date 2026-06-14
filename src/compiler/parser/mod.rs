@@ -71,6 +71,18 @@ pub enum Expr {
 
     // 範囲: 0..10 / 0..=10
     Range { start: Box<Expr>, end: Box<Expr>, inclusive: bool },
+
+    // レコードリテラル / スプレッド
+    RecordLit(Vec<(String, Expr)>),
+    RecordSpread { base: Box<Expr>, fields: Vec<(String, Expr)> },
+
+    // リスト / 辞書リテラル
+    ListLit(Vec<Expr>),
+    DictLit(Vec<(Expr, Expr)>),
+
+    // Pipe operator
+    Pipe { lhs: Box<Expr>, rhs: Box<Expr> },      // data |> func
+    PipeMethod { name: String, args: Vec<Expr> },  // .method(args)
 }
 
 #[derive(Debug, Clone)]
@@ -83,7 +95,15 @@ pub enum CatchHandler {
 #[derive(Debug, Clone)]
 pub struct MatchArm {
     pub pattern: Pattern,
+    pub guard:   Option<Expr>,    // if condition
     pub body:    Expr,
+}
+
+#[derive(Debug, Clone)]
+pub struct SchemaField {
+    pub name: String,
+    pub ty: Type,
+    pub constraint: Option<Expr>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +118,8 @@ pub enum Pattern {
     Err(String),
     Ident(String),
     Or(Vec<Pattern>),
+    Record(Vec<(String, Option<String>)>),  // {name, age: a}
+    List { elements: Vec<Pattern>, rest: Option<Box<Pattern>> },  // [head, ...tail]
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +148,12 @@ pub enum TopLevel {
         source: ImportSource,
         path:   Vec<String>,   // std/skp以降のパス (空もあり)
         names:  Vec<(String, Option<String>)>,
+    },
+    TypeAlias { name: String, ty: Type },
+    Schema {
+        name: String,
+        fields: Vec<SchemaField>,
+        includes: Option<String>,
     },
 }
 
@@ -161,6 +189,7 @@ pub enum Type {
     Fn(Vec<Type>, Box<Type>),
     Named(String),
     Generic(String, Vec<Type>),
+    Record { fields: Vec<(String, Type)>, open: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -282,6 +311,8 @@ impl Parser {
             Token::Impl   => self.parse_impl(),
             Token::Import => self.parse_import(),
             Token::From   => self.parse_from_import(),
+            Token::Type   => self.parse_type_alias(),
+            Token::Schema => self.parse_schema(),
             t => Err(self.error(&format!("unexpected token at top level: {:?}", t))),
         }
     }
@@ -326,6 +357,41 @@ impl Parser {
 
         self.expect(&Token::Dedent)?;
         std::result::Result::Ok(TopLevel::Struct { name, fields })
+    }
+
+    // schema Name (includes Parent)?:\n  INDENT fields DEDENT
+    fn parse_schema(&mut self) -> Result<TopLevel, ParseError> {
+        self.expect(&Token::Schema)?;
+        let name = self.parse_ident()?;
+
+        let includes = if self.eat(&Token::Includes) {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
+
+        self.expect(&Token::LBrace)?;
+        let mut fields = Vec::new();
+        while *self.peek() != Token::RBrace {
+            if !fields.is_empty() { self.eat(&Token::Comma); }
+            if *self.peek() == Token::RBrace { break; }
+
+            let fname = self.parse_ident()?;
+            self.expect(&Token::Colon)?;
+            let ftype = self.parse_type()?;
+
+            let constraint = if self.eat(&Token::Where) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+
+            fields.push(SchemaField { name: fname, ty: ftype, constraint });
+            self.eat(&Token::Comma);
+        }
+        self.expect(&Token::RBrace)?;
+
+        Ok(TopLevel::Schema { name, fields, includes })
     }
 
     // impl Name:\n  INDENT fn* DEDENT
@@ -399,6 +465,14 @@ impl Parser {
 
         self.eat(&Token::Newline);
         std::result::Result::Ok(TopLevel::FromImport { source, path, names })
+    }
+
+    fn parse_type_alias(&mut self) -> Result<TopLevel, ParseError> {
+        self.expect(&Token::Type)?;
+        let name = self.parse_ident()?;
+        self.expect(&Token::Eq)?;
+        let ty = self.parse_type()?;
+        Ok(TopLevel::TypeAlias { name, ty })
     }
 
     fn parse_dotted_path(&mut self) -> Result<Vec<String>, ParseError> {
@@ -525,6 +599,20 @@ impl Parser {
                 let ret = self.parse_type()?;
                 Type::Fn(args, Box::new(ret))
             }
+            Token::LBrace => {
+                let mut fields = Vec::new();
+                while *self.peek() != Token::RBrace && *self.peek() != Token::DotDotDot {
+                    if !fields.is_empty() { self.expect(&Token::Comma)?; }
+                    if *self.peek() == Token::RBrace || *self.peek() == Token::DotDotDot { break; }
+                    let fname = self.parse_ident()?;
+                    self.expect(&Token::Colon)?;
+                    let ftype = self.parse_type()?;
+                    fields.push((fname, ftype));
+                }
+                let open = self.eat(&Token::DotDotDot);
+                self.expect(&Token::RBrace)?;
+                Type::Record { fields, open }
+            }
             t => return Err(self.error(&format!("expected type, got {:?}", t))),
         };
         std::result::Result::Ok(ty)
@@ -630,7 +718,7 @@ impl Parser {
     // ============================================================
 
     pub fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        self.parse_range()
+        self.parse_pipe()
     }
 
     // expr .. expr  /  expr ..= expr
@@ -649,6 +737,16 @@ impl Parser {
             });
         }
         std::result::Result::Ok(expr)
+    }
+
+    // pipe: expr |> func / expr |> expr.method()
+    fn parse_pipe(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_range()?;
+        while self.eat(&Token::PipeArrow) {
+            let rhs = self.parse_postfix()?;
+            lhs = Expr::Pipe { lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
     }
 
     // catch expr  /  catch |e| expr  /  catch |e|: block
@@ -879,7 +977,77 @@ impl Parser {
                 }
             }
 
+            Token::LBrace => {
+                self.advance();
+                self.parse_record_or_dict_lit()
+            }
+
+            Token::LBracket => {
+                self.advance();
+                let mut elements = Vec::new();
+                while *self.peek() != Token::RBracket {
+                    if !elements.is_empty() { self.expect(&Token::Comma)?; }
+                    if *self.peek() == Token::RBracket { break; }
+                    elements.push(self.parse_expr()?);
+                }
+                self.expect(&Token::RBracket)?;
+                Ok(Expr::ListLit(elements))
+            }
+
+            Token::Dot => {
+                self.advance(); // consume '.'
+                let name = self.parse_ident()?;
+                if self.eat(&Token::LParen) {
+                    let mut args = Vec::new();
+                    while *self.peek() != Token::RParen {
+                        if !args.is_empty() { self.expect(&Token::Comma)?; }
+                        if *self.peek() == Token::RParen { break; }
+                        args.push(self.parse_expr()?);
+                    }
+                    self.expect(&Token::RParen)?;
+                    Ok(Expr::PipeMethod { name, args })
+                } else {
+                    Ok(Expr::PipeMethod { name, args: vec![] })
+                }
+            }
+
             t => Err(self.error(&format!("unexpected token in expression: {:?}", t))),
+        }
+    }
+
+    fn parse_record_or_dict_lit(&mut self) -> Result<Expr, ParseError> {
+        // { is already consumed by caller
+        if *self.peek() == Token::RBrace {
+            self.advance();
+            return Ok(Expr::RecordLit(vec![]));
+        }
+
+        let has_spread = self.eat(&Token::DotDotDot);
+        let base = if has_spread {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+
+        if has_spread {
+            self.eat(&Token::Comma);
+        }
+
+        let mut fields = Vec::new();
+        while *self.peek() != Token::RBrace {
+            if !fields.is_empty() { self.expect(&Token::Comma)?; }
+            if *self.peek() == Token::RBrace { break; }
+            let fname = self.parse_ident()?;
+            self.expect(&Token::Colon)?;
+            let fval = self.parse_expr()?;
+            fields.push((fname, fval));
+        }
+        self.expect(&Token::RBrace)?;
+
+        if has_spread {
+            Ok(Expr::RecordSpread { base: base.unwrap(), fields })
+        } else {
+            Ok(Expr::RecordLit(fields))
         }
     }
 
@@ -952,10 +1120,15 @@ impl Parser {
             self.skip_newlines();
             if *self.peek() == Token::Dedent { break; }
             let pattern = self.parse_pattern()?;
+            let guard = if self.eat(&Token::If) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
             self.expect(&Token::FatArrow)?;
             let body = self.parse_expr_or_block()?;
             self.eat(&Token::Newline);
-            arms.push(MatchArm { pattern, body });
+            arms.push(MatchArm { pattern, guard, body });
         }
 
         self.expect(&Token::Dedent)?;
@@ -1024,8 +1197,47 @@ impl Parser {
                 Ok(Pattern::Err(n))
             }
             Token::Ident(name) => { self.advance(); Ok(Pattern::Ident(name)) }
+            Token::LBrace => return self.parse_record_pattern(),
+            Token::LBracket => return self.parse_list_pattern(),
             t => Err(self.error(&format!("expected pattern, got {:?}", t))),
         }
+    }
+
+    fn parse_record_pattern(&mut self) -> Result<Pattern, ParseError> {
+        self.advance(); // consume '{'
+        let mut fields = Vec::new();
+        while *self.peek() != Token::RBrace {
+            if !fields.is_empty() { self.expect(&Token::Comma)?; }
+            if *self.peek() == Token::RBrace { break; }
+            let name = self.parse_ident()?;
+            if self.eat(&Token::Colon) {
+                let alias = self.parse_ident()?;
+                fields.push((name, Some(alias)));
+            } else {
+                fields.push((name, None));
+            }
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(Pattern::Record(fields))
+    }
+
+    fn parse_list_pattern(&mut self) -> Result<Pattern, ParseError> {
+        self.advance(); // consume '['
+        let mut elements = Vec::new();
+        let mut rest = None;
+        while *self.peek() != Token::RBracket {
+            if !elements.is_empty() { self.expect(&Token::Comma)?; }
+            if *self.peek() == Token::RBracket { break; }
+            if self.eat(&Token::DotDotDot) {
+                let name = self.parse_ident()?;
+                rest = Some(Box::new(Pattern::Ident(name)));
+                if self.eat(&Token::Comma) { /* ok */ }
+                break;
+            }
+            elements.push(self.parse_single_pattern()?);
+        }
+        self.expect(&Token::RBracket)?;
+        Ok(Pattern::List { elements, rest })
     }
 
     // ============================================================

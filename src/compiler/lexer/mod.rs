@@ -43,6 +43,10 @@ pub enum Token {
     NoneKw,   // None
     OkKw,     // Ok(...)
     ErrKw,    // Err(...)
+    Type,     // type
+    Schema,     // schema
+    Where,      // where
+    Includes,   // includes
 
     // 型キーワード
     TInt,
@@ -75,12 +79,14 @@ pub enum Token {
     Or,         // ||
     Not,        // !
     Pipe,       // |
+    PipeArrow,  // |>
     Arrow,      // ->
     FatArrow,   // =>
     Question,   // ?
     Colon,      // :
     Dot,        // .
     DotDot,     // ..
+    DotDotDot,  // ...
     DotDotEq,   // ..=
     Comma,      // ,
     Semicolon,  // ;
@@ -297,6 +303,10 @@ impl Lexer {
             "as"       => Token::As,
             "try"      => Token::Try,
             "catch"    => Token::Catch,
+            "type"     => Token::Type,
+            "schema"   => Token::Schema,
+            "where"    => Token::Where,
+            "includes" => Token::Includes,
             "Some"     => Token::SomeKw,
             "None"     => Token::NoneKw,
             "Ok"       => Token::OkKw,
@@ -363,6 +373,7 @@ impl Lexer {
             }
             '|' => {
                 if self.peek() == Some('|') { self.advance(); Token::Or }
+                else if self.peek() == Some('>') { self.advance(); Token::PipeArrow }
                 else { Token::Pipe }
             }
             '?' => Token::Question,
@@ -370,7 +381,8 @@ impl Lexer {
             '.' => {
                 if self.peek() == Some('.') {
                     self.advance();
-                    if self.peek() == Some('=') { self.advance(); Token::DotDotEq }
+                    if self.peek() == Some('.') { self.advance(); Token::DotDotDot }
+                    else if self.peek() == Some('=') { self.advance(); Token::DotDotEq }
                     else { Token::DotDot }
                 } else {
                     Token::Dot
